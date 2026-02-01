@@ -1,0 +1,700 @@
+
+from dotenv import load_dotenv
+load_dotenv()
+
+from flask import Flask, request, jsonify, render_template, send_from_directory, session, redirect, url_for, Response
+from flask_cors import CORS
+import csv
+import io
+from create_auth_db import (
+    validate_user, get_user_role, save_submission, 
+    get_all_submissions, get_submission_detail, 
+    get_all_students, get_student_submissions,
+    get_submissions_by_time_range, get_all_submissions_with_content,
+    add_question, get_active_questions, get_all_questions, delete_question,
+    permanently_delete_question, init_settings, get_setting, set_setting
+)
+
+# Initialize settings
+init_settings()
+from evaluator import evaluate_uploaded_content, find_similar_submissions
+from file_extractor import extract_text_from_file, parse_question_from_text
+import os
+import re
+from werkzeug.utils import secure_filename
+
+
+app = Flask(__name__)
+app.secret_key = os.environ.get('SECRET_KEY', 'dev_secret_key')
+
+# =====================================================
+# CORS CONFIGURATION
+# =====================================================
+# Update FRONTEND_URL for production deployment
+# For local development: 'http://localhost:3000'
+# For Vercel: 'https://your-app-name.vercel.app'
+# =====================================================
+FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:3000')
+
+# Check if running in production (HTTPS)
+IS_PRODUCTION = FRONTEND_URL.startswith('https://')
+
+# Configure CORS to allow requests from your frontend
+CORS(app, 
+     resources={r"/*": {"origins": FRONTEND_URL}},
+     supports_credentials=True,
+     allow_headers=['Content-Type', 'Authorization', 'X-Requested-With'],
+     expose_headers=['Set-Cookie'],
+     methods=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'])
+
+# Configure session cookie for cross-origin requests
+if IS_PRODUCTION:
+    # Production: Secure cookies required for cross-origin
+    app.config['SESSION_COOKIE_SAMESITE'] = 'None'
+    app.config['SESSION_COOKIE_SECURE'] = True
+else:
+    # Development: Lax cookies work for localhost
+    app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+    app.config['SESSION_COOKIE_SECURE'] = False
+
+# Ensure uploads directory exists
+UPLOAD_FOLDER = os.path.join(os.getcwd(), 'uploads')
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+
+
+# ============================================
+# Page Routes
+# ============================================
+
+@app.route('/')
+def index():
+    return render_template('login.html')
+
+
+@app.route('/login.html')
+def login_html():
+    return render_template('login.html')
+
+
+@app.route('/index.html')
+def index_html():
+    # Only students can access this page
+    if 'username' not in session:
+        return redirect('/login.html')
+    if session.get('role') == 'admin':
+        return redirect('/admin.html')
+    return render_template('index.html')
+
+
+@app.route('/admin.html')
+def admin_html():
+    # Only admins can access this page
+    if 'username' not in session or session.get('role') != 'admin':
+        return redirect('/login.html')
+    return render_template('admin.html')
+
+
+@app.route('/questions.html')
+def questions_html():
+    # Only admins can access this page
+    if 'username' not in session or session.get('role') != 'admin':
+        return redirect('/login.html')
+    return render_template('questions.html')
+
+
+# ============================================
+# Authentication Routes
+# ============================================
+
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.get_json()
+    username = data.get('username')
+    password = data.get('password')
+
+    user = validate_user(username, password)
+    if user:
+        session['username'] = user['username']
+        session['user_id'] = user['id']
+        session['role'] = user['role']
+        session['name'] = user.get('name', user['username'])
+        return jsonify({
+            'success': True, 
+            'role': user['role']
+        }), 200
+    else:
+        return jsonify({
+            'success': False, 
+            'message': 'Invalid username or password'
+        }), 401
+
+
+@app.route('/auth-check')
+def auth_check():
+    if 'username' in session:
+        return '', 200
+    return '', 401
+
+
+@app.route('/admin-check')
+def admin_check():
+    if 'username' in session and session.get('role') == 'admin':
+        return '', 200
+    return '', 401
+
+
+@app.route('/get-user-info')
+def get_user_info():
+    if 'username' in session:
+        return jsonify({
+            'username': session.get('name', session['username']),
+            'role': session.get('role', 'student')
+        })
+    return jsonify({}), 401
+
+
+@app.route('/logout', methods=['GET', 'POST'])
+def logout():
+    session.clear()
+    return jsonify({'success': True, 'message': 'Logged out successfully'}), 200
+
+
+# ============================================
+# File Upload & Evaluation (Student)
+# ============================================
+
+def extract_score_from_evaluation(evaluation_text):
+    """Extract overall score from evaluation text"""
+    if not evaluation_text:
+        return 0
+    
+    # Try to find patterns like "Overall Score: 85/100" or "Overall: 85"
+    patterns = [
+        r'Overall\s*Score[:\s]*(\d+)',
+        r'Overall[:\s]*(\d+)',
+        r'\*\*Overall\s*Score\*\*[:\s]*(\d+)',
+        r'(\d+)/100',
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, evaluation_text, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+    
+    return 50  # Default score if not found
+
+
+@app.route('/upload-c', methods=['POST'])
+def upload_c_file():
+    if 'username' not in session:
+        return jsonify({'success': False, 'message': 'Unauthorized'}), 401
+    
+    if 'cfile' not in request.files:
+        return jsonify({'success': False, 'message': 'No file part'}), 400
+    
+    file = request.files['cfile']
+    if file.filename == '':
+        return jsonify({'success': False, 'message': 'No selected file'}), 400
+        
+    # Validation against allowed extensions from DB
+    allowed_str = get_setting('allowed_extensions', 'c,cpp,java,py,txt')
+    # Clean string and make set of extensions (with . prefix)
+    allowed_set = {f".{ext.strip().lower()}" for ext in allowed_str.split(',') if ext.strip()}
+    
+    file_ext = os.path.splitext(file.filename.lower())[1]
+    
+    if file_ext not in allowed_set:
+         return jsonify({'success': False, 'message': f'File type not allowed. Supported: {allowed_str}'}), 400
+    
+    # Get the problem statement from request
+    problem_statement = request.form.get('problem', 'Check Array is Sorted')
+    
+    # Decode file content directly from memory
+    file_content = file.read().decode('utf-8', errors='ignore')
+    filename = secure_filename(file.filename)
+    
+    # Evaluate the file using Groq LLM
+    evaluation_result = evaluate_uploaded_content(file_content, problem_statement)
+    
+    # Determine status based on evaluation
+    score = 0
+    status = 'rejected'
+    evaluation_text = None
+    ai_score = 0
+    
+    if evaluation_result['success']:
+        evaluation_text = evaluation_result['evaluation']
+        score = extract_score_from_evaluation(evaluation_text)
+        ai_score = evaluation_result.get('ai_score', 0)  # Get AI detection score
+        
+        # Check for PASS/FAIL in evaluation or score threshold
+        if 'PASS' in evaluation_text.upper() or score >= 60:
+            status = 'accepted'
+        else:
+            status = 'rejected'
+    
+    # Save submission to database with AI score
+    save_submission(
+        user_id=session.get('user_id', 0),
+        username=session['username'],
+        problem_title=problem_statement.split('\n')[0][:100],
+        filename=filename,
+        file_content=file_content,
+        status=status,
+        evaluation=evaluation_text,
+        score=score,
+        ai_score=ai_score  # Now properly saving the AI detection score
+    )
+    
+    # Return status and score to student
+    return jsonify({
+        'success': True,
+        'status': status,
+        'score': score,
+        'message': 'Submitted successfully!' if status == 'accepted' else 'Submission rejected.'
+    }), 200
+
+
+# ============================================
+# Student API Routes
+# ============================================
+
+@app.route('/api/student/my-submissions')
+def api_student_submissions():
+    """Get all submissions for the currently logged-in student"""
+    if 'username' not in session:
+        return jsonify([]), 401
+    
+    # Get the logged-in student's username (register number)
+    username = session['username']
+    submissions = get_student_submissions(username)
+    
+    return jsonify(submissions)
+
+
+@app.route('/api/student/submission/<int:submission_id>')
+def api_student_submission_detail(submission_id):
+    """Get details of a specific submission (only if it belongs to the current student)"""
+    if 'username' not in session:
+        return jsonify({}), 401
+    
+    submission = get_submission_detail(submission_id)
+    
+    # Verify this submission belongs to the current user
+    if submission and submission.get('register_no') == session['username']:
+        return jsonify(submission)
+    
+    return jsonify({'error': 'Not found or unauthorized'}), 404
+
+
+# ============================================
+# Admin API Routes
+# ============================================
+
+@app.route('/api/admin/reset-submissions', methods=['POST'])
+def api_admin_reset_submissions():
+    if 'username' not in session or session.get('role') != 'admin':
+        return jsonify({'success': False, 'message': 'Unauthorized'}), 401
+    try:
+        from create_auth_db import reset_all_submissions
+        reset_all_submissions()
+        return jsonify({'success': True, 'message': 'All submissions deleted.'})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+@app.route('/api/admin/students')
+def api_admin_students():
+    if 'username' not in session or session.get('role') != 'admin':
+        return jsonify([]), 401
+    
+    students = get_all_students()
+    return jsonify(students)
+
+
+@app.route('/api/admin/submissions')
+def api_admin_submissions():
+    if 'username' not in session or session.get('role') != 'admin':
+        return jsonify([]), 401
+    
+    username = request.args.get('username')
+    
+    if username:
+        submissions = get_student_submissions(username)
+    else:
+        submissions = get_all_submissions()
+    
+    return jsonify(submissions)
+
+
+@app.route('/api/admin/submission/<int:submission_id>')
+def api_admin_submission_detail(submission_id):
+    if 'username' not in session or session.get('role') != 'admin':
+        return jsonify({}), 401
+    
+    submission = get_submission_detail(submission_id)
+    if submission:
+        return jsonify(submission)
+    return jsonify({'error': 'Not found'}), 404
+
+
+@app.route('/api/admin/submission/<int:submission_id>/similar')
+def api_admin_similar_submissions(submission_id):
+    """Find submissions with similar code to the given submission"""
+    if 'username' not in session or session.get('role') != 'admin':
+        return jsonify([]), 401
+    
+    submission = get_submission_detail(submission_id)
+    if not submission or not submission.get('file_content'):
+        return jsonify([]), 404
+    
+    # Get all submissions for comparison
+    all_submissions = get_all_submissions_with_content()
+    
+    # Find similar submissions (excluding the current one)
+    similar = find_similar_submissions(
+        submission['file_content'], 
+        all_submissions, 
+        current_submission_id=submission_id,
+        threshold=70.0
+    )
+    
+    return jsonify(similar)
+
+
+@app.route('/api/admin/send-reports/preview', methods=['POST'])
+def api_admin_send_reports_preview():
+    """Preview which students will receive reports based on time range"""
+    if 'username' not in session or session.get('role') != 'admin':
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    data = request.get_json()
+    time_range = data.get('timeRange', 'all')  # 1h, 6h, 24h, 7d, 30d, all
+    
+    # Get submissions based on time range
+    submissions = get_submissions_by_time_range(time_range)
+    
+    # Group by student
+    students_data = {}
+    for sub in submissions:
+        reg_no = sub.get('register_no') or sub.get('username')
+        if reg_no not in students_data:
+            students_data[reg_no] = {
+                'name': sub.get('name', sub.get('username', reg_no)),
+                'email': sub.get('email', ''),
+                'register_no': reg_no,
+                'submissions': []
+            }
+        students_data[reg_no]['submissions'].append(sub)
+    
+    # Build preview list
+    preview = []
+    for reg_no, data in students_data.items():
+        preview.append({
+            'register_no': reg_no,
+            'name': data['name'],
+            'email': data['email'] or 'No email',
+            'has_email': bool(data['email']),
+            'submission_count': len(data['submissions']),
+            'accepted': sum(1 for s in data['submissions'] if s['status'] == 'accepted'),
+            'avg_score': sum(s.get('score', 0) for s in data['submissions']) / len(data['submissions']) if data['submissions'] else 0
+        })
+    
+    # Sort by name
+    preview.sort(key=lambda x: x['name'])
+    
+    return jsonify({
+        'total_students': len(preview),
+        'with_email': sum(1 for p in preview if p['has_email']),
+        'without_email': sum(1 for p in preview if not p['has_email']),
+        'total_submissions': len(submissions),
+        'students': preview
+    })
+
+
+@app.route('/api/admin/export-submissions')
+def export_submissions_csv():
+    """Export all submissions as CSV"""
+    if 'username' not in session or session.get('role') != 'admin':
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    submissions = get_all_submissions()
+    
+    # Create CSV
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['Student Name', 'Register No', 'Problem', 'File', 'Status', 'Score', 'AI Score', 'Submitted At'])
+    
+    for s in submissions:
+        writer.writerow([
+            s.get('username', ''), 
+            s.get('register_no', ''), 
+            s.get('problem_title', ''), 
+            s.get('filename', ''),
+            s.get('status', ''), 
+            s.get('score', 0), 
+            s.get('ai_score', 0), 
+            s.get('submitted_at', '')
+        ])
+    
+    return Response(
+        output.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-disposition": "attachment; filename=submissions_export.csv"}
+    )
+
+
+@app.route('/analytics')
+def analytics_dashboard():
+    """Analytics Dashboard Page"""
+    if 'username' not in session or session.get('role') != 'admin':
+        return redirect('/login.html')
+    return render_template('analytics.html')
+
+
+@app.route('/analytics.html')
+def analytics_html():
+    """Analytics Dashboard HTML Page"""
+    if 'username' not in session or session.get('role') != 'admin':
+        return redirect('/login.html')
+    return render_template('analytics.html')
+
+
+@app.route('/api/config/extensions')
+def get_allowed_extensions():
+    """Get allowed extensions (public)"""
+    exts = get_setting('allowed_extensions', 'c,cpp,java,py,txt')
+    return jsonify({'extensions': exts})
+
+
+@app.route('/api/admin/config/extensions', methods=['POST'])
+def update_allowed_extensions():
+    """Update allowed extensions (admin only)"""
+    if 'username' not in session or session.get('role') != 'admin':
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    data = request.get_json()
+    exts = data.get('extensions', '')
+    
+    # Simple validation: valid characters
+    if not re.match(r'^[a-zA-Z0-9, ]+$', exts):
+         return jsonify({'success': False, 'message': 'Invalid format. Use comma separated alphanumeric values.'}), 400
+
+    set_setting('allowed_extensions', exts)
+    return jsonify({'success': True, 'extensions': exts})
+
+
+@app.route('/api/admin/send-reports', methods=['POST'])
+def api_admin_send_reports():
+    """Send reports to students based on time range"""
+    if 'username' not in session or session.get('role') != 'admin':
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    from email_utils import send_bulk_reports, is_email_configured
+    
+    if not is_email_configured():
+        return jsonify({
+            'success': False,
+            'message': 'Email not configured. Set SMTP_USER and SMTP_PASSWORD in environment variables.'
+        }), 400
+    
+    data = request.get_json()
+    time_range = data.get('timeRange', 'all')
+    
+    # Get submissions based on time range
+    submissions = get_submissions_by_time_range(time_range)
+    
+    if not submissions:
+        return jsonify({
+            'success': False,
+            'message': 'No submissions found for the selected time range.'
+        }), 400
+    
+    # Get all submissions for similarity checking
+    all_submissions = get_all_submissions_with_content()
+    
+    # Add similarity info to each submission
+    for sub in submissions:
+        if sub.get('file_content'):
+            similar = find_similar_submissions(
+                sub['file_content'],
+                all_submissions,
+                current_submission_id=sub.get('id'),
+                threshold=70.0
+            )
+            sub['similar_students'] = similar
+        else:
+            sub['similar_students'] = []
+    
+    # Group by student for bulk sending
+    students_data = {}
+    for sub in submissions:
+        reg_no = sub.get('register_no') or sub.get('username')
+        if reg_no not in students_data:
+            students_data[reg_no] = {
+                'name': sub.get('name', sub.get('username', reg_no)),
+                'email': sub.get('email', ''),
+                'submissions': []
+            }
+        students_data[reg_no]['submissions'].append(sub)
+    
+    # Send bulk reports
+    results = send_bulk_reports(students_data)
+    
+    return jsonify({
+        'success': True,
+        'sent': results['sent'],
+        'failed': results['failed'],
+        'skipped': results['skipped'],
+        'details': results['details']
+    })
+
+
+# ============================================
+# Question Management Routes
+# ============================================
+
+@app.route('/api/questions/active')
+def get_questions_active():
+    """Get all active questions for students"""
+    questions = get_active_questions()
+    return jsonify(questions)
+
+
+@app.route('/api/admin/questions')
+def get_questions_admin():
+    """Get all questions for admin (including inactive)"""
+    if 'username' not in session or session.get('role') != 'admin':
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    questions = get_all_questions()
+    return jsonify(questions)
+
+
+@app.route('/api/admin/upload-question', methods=['POST'])
+def upload_question_file():
+    """Upload a question file and extract content"""
+    if 'username' not in session or session.get('role') != 'admin':
+        return jsonify({'success': False, 'message': 'Unauthorized'}), 401
+    
+    if 'questionFile' not in request.files:
+        return jsonify({'success': False, 'message': 'No file uploaded'}), 400
+    
+    file = request.files['questionFile']
+    if file.filename == '':
+        return jsonify({'success': False, 'message': 'No file selected'}), 400
+    
+    # Check file extension
+    allowed_extensions = {'.txt', '.pdf', '.doc', '.docx', '.ppt', '.pptx'}
+    _, ext = os.path.splitext(file.filename.lower())
+    
+    if ext not in allowed_extensions:
+        return jsonify({
+            'success': False, 
+            'message': f'Unsupported file type. Allowed: {", ".join(allowed_extensions)}'
+        }), 400
+    
+    try:
+        # Save file temporarily
+        filename = secure_filename(file.filename)
+        temp_path = os.path.join(app.config['UPLOAD_FOLDER'], f'temp_question_{filename}')
+        file.save(temp_path)
+        
+        # Extract text from file
+        extracted_text = extract_text_from_file(temp_path)
+        
+        # Clean up temp file
+        os.remove(temp_path)
+        
+        if extracted_text.startswith('Error:'):
+            return jsonify({'success': False, 'message': extracted_text}), 400
+        
+        # Parse question details
+        question_data = parse_question_from_text(extracted_text)
+        
+        # Add to database
+        question_id = add_question(
+            title=question_data['title'],
+            description=question_data['description'],
+            difficulty=question_data.get('difficulty', 'Medium'),
+            created_by=session['username']
+        )
+        
+        return jsonify({
+            'success': True,
+            'message': 'Question added successfully!',
+            'question_id': question_id,
+            'question': question_data
+        })
+        
+    except Exception as e:
+        # Clean up temp file if it exists
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        
+        return jsonify({
+            'success': False,
+            'message': f'Error processing file: {str(e)}'
+        }), 500
+
+
+@app.route('/api/admin/questions', methods=['GET'])
+def get_all_questions_route():
+    """Get all questions for admin"""
+    if 'username' not in session or session.get('role') != 'admin':
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    try:
+        questions = get_all_questions()
+        return jsonify(questions)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/admin/delete-question/<int:question_id>', methods=['DELETE'])
+def delete_question_route(question_id):
+    """Delete a question (soft delete)"""
+    if 'username' not in session or session.get('role') != 'admin':
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    try:
+        delete_question(question_id)
+        return jsonify({'success': True, 'message': 'Question deleted successfully'})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+
+@app.route('/api/admin/permanently-delete-question/<int:question_id>', methods=['DELETE'])
+def permanently_delete_question_route(question_id):
+    """Permanently delete a question from database"""
+    if 'username' not in session or session.get('role') != 'admin':
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    try:
+        permanently_delete_question(question_id)
+        return jsonify({'success': True, 'message': 'Question permanently deleted'})
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+
+# ============================================
+# Static Files
+# ============================================
+
+@app.route('/static/<path:filename>')
+def serve_static(filename):
+    return send_from_directory('static', filename)
+
+
+@app.route('/<path:filename>')
+def serve_static_file(filename):
+    static_folder = os.path.join(os.getcwd(), 'static')
+    return send_from_directory(static_folder, filename)
+
+
+# ============================================
+# Run Server
+# ============================================
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
