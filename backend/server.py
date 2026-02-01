@@ -458,20 +458,6 @@ def export_submissions_csv():
     )
 
 
-@app.route('/analytics')
-@admin_required
-def analytics_dashboard():
-    """Analytics Dashboard Page"""
-    return render_template('analytics.html')
-
-
-@app.route('/analytics.html')
-@admin_required
-def analytics_html():
-    """Analytics Dashboard HTML Page"""
-    return render_template('analytics.html')
-
-
 @app.route('/api/config/extensions')
 def get_allowed_extensions():
     """Get allowed extensions (public)"""
