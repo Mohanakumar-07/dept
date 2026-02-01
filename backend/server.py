@@ -1,8 +1,7 @@
-
 from dotenv import load_dotenv
 load_dotenv()
 
-from flask import Flask, request, jsonify, render_template, send_from_directory, session, redirect, url_for, Response
+from flask import Flask, request, jsonify, session, redirect, url_for, Response
 from flask_cors import CORS
 from functools import wraps
 import csv
@@ -24,13 +23,8 @@ import os
 import re
 from werkzeug.utils import secure_filename
 
-# Get the base directory paths
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-FRONTEND_DIR = os.path.join(BASE_DIR, 'frontend')
-
-app = Flask(__name__, 
-            template_folder=os.path.join(FRONTEND_DIR, 'templates'),
-            static_folder=os.path.join(FRONTEND_DIR, 'static'))
+# Backend is an API-only server, frontend is hosted separately
+app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'dev_secret_key')
 
 # =====================================================
@@ -40,7 +34,7 @@ app.secret_key = os.environ.get('SECRET_KEY', 'dev_secret_key')
 # For local development: 'http://localhost:3000'
 # For Vercel: 'https://your-app-name.vercel.app'
 # =====================================================
-FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:3000')
+FRONTEND_URL = os.environ.get('FRONTEND_URL', 'https://dept.mkhub.in')
 
 # Check if running in production (HTTPS)
 IS_PRODUCTION = FRONTEND_URL.startswith('https://')
@@ -103,40 +97,43 @@ def admin_required(f):
 
 
 # ============================================
-# Page Routes
+# Page Routes - Redirect to Frontend
 # ============================================
+# Since frontend is hosted separately, redirect page requests to frontend
 
 @app.route('/')
 def index():
-    return render_template('login.html')
+    return redirect(FRONTEND_URL + '/login.html')
 
 
 @app.route('/login.html')
 def login_html():
-    return render_template('login.html')
+    return redirect(FRONTEND_URL + '/login.html')
 
 
 @app.route('/index.html')
-@login_required
 def index_html():
-    # Only students can access this page
-    if session.get('role') == 'admin':
-        return redirect('/admin.html')
-    return render_template('index.html')
+    return redirect(FRONTEND_URL + '/index.html')
 
 
 @app.route('/admin.html')
-@admin_required
 def admin_html():
-    # Only admins can access this page
-    return render_template('admin.html')
+    return redirect(FRONTEND_URL + '/admin.html')
 
 
 @app.route('/questions.html')
-@admin_required
 def questions_html():
-    # Only admins can access this page
-    return render_template('questions.html')
+    return redirect(FRONTEND_URL + '/questions.html')
+
+
+@app.route('/analytics')
+def analytics_redirect():
+    return redirect(FRONTEND_URL + '/analytics.html')
+
+
+@app.route('/analytics.html')
+def analytics_html():
+    return redirect(FRONTEND_URL + '/analytics.html')
 
 
 # ============================================
@@ -678,24 +675,10 @@ def permanently_delete_question_route(question_id):
         return jsonify({'success': False, 'message': str(e)}), 500
 
 
-# ============================================
-# Static Files
-# ============================================
-
-@app.route('/static/<path:filename>')
-def serve_static(filename):
-    return send_from_directory(os.path.join(FRONTEND_DIR, 'static'), filename)
-
-
-@app.route('/<path:filename>')
-def serve_static_file(filename):
-    return send_from_directory(os.path.join(FRONTEND_DIR, 'static'), filename)
-
 
 # ============================================
 # Run Server
 # ============================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 4567))
-
     app.run(host="0.0.0.0", port=port)
