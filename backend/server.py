@@ -4,6 +4,7 @@ load_dotenv()
 
 from flask import Flask, request, jsonify, render_template, send_from_directory, session, redirect, url_for, Response
 from flask_cors import CORS
+from functools import wraps
 import csv
 import io
 from create_auth_db import (
@@ -64,6 +65,39 @@ app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
 
 # ============================================
+# Authentication Decorators
+# ============================================
+
+def login_required(f):
+    """Decorator to require login for a route"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'username' not in session:
+            # Check if this is an API route or page route
+            if request.path.startswith('/api/'):
+                return jsonify({'error': 'Unauthorized', 'message': 'Login required'}), 401
+            return redirect('/login.html')
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+def admin_required(f):
+    """Decorator to require admin role for a route"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'username' not in session:
+            if request.path.startswith('/api/'):
+                return jsonify({'error': 'Unauthorized', 'message': 'Login required'}), 401
+            return redirect('/login.html')
+        if session.get('role') != 'admin':
+            if request.path.startswith('/api/'):
+                return jsonify({'error': 'Forbidden', 'message': 'Admin access required'}), 403
+            return redirect('/login.html')
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+# ============================================
 # Page Routes
 # ============================================
 
@@ -78,28 +112,25 @@ def login_html():
 
 
 @app.route('/index.html')
+@login_required
 def index_html():
     # Only students can access this page
-    if 'username' not in session:
-        return redirect('/login.html')
     if session.get('role') == 'admin':
         return redirect('/admin.html')
     return render_template('index.html')
 
 
 @app.route('/admin.html')
+@admin_required
 def admin_html():
     # Only admins can access this page
-    if 'username' not in session or session.get('role') != 'admin':
-        return redirect('/login.html')
     return render_template('admin.html')
 
 
 @app.route('/questions.html')
+@admin_required
 def questions_html():
     # Only admins can access this page
-    if 'username' not in session or session.get('role') != 'admin':
-        return redirect('/login.html')
     return render_template('questions.html')
 
 
@@ -186,10 +217,8 @@ def extract_score_from_evaluation(evaluation_text):
 
 
 @app.route('/upload-c', methods=['POST'])
+@login_required
 def upload_c_file():
-    if 'username' not in session:
-        return jsonify({'success': False, 'message': 'Unauthorized'}), 401
-    
     if 'cfile' not in request.files:
         return jsonify({'success': False, 'message': 'No file part'}), 400
     
@@ -261,11 +290,9 @@ def upload_c_file():
 # ============================================
 
 @app.route('/api/student/my-submissions')
+@login_required
 def api_student_submissions():
     """Get all submissions for the currently logged-in student"""
-    if 'username' not in session:
-        return jsonify([]), 401
-    
     # Get the logged-in student's username (register number)
     username = session['username']
     submissions = get_student_submissions(username)
@@ -274,11 +301,9 @@ def api_student_submissions():
 
 
 @app.route('/api/student/submission/<int:submission_id>')
+@login_required
 def api_student_submission_detail(submission_id):
     """Get details of a specific submission (only if it belongs to the current student)"""
-    if 'username' not in session:
-        return jsonify({}), 401
-    
     submission = get_submission_detail(submission_id)
     
     # Verify this submission belongs to the current user
@@ -293,9 +318,8 @@ def api_student_submission_detail(submission_id):
 # ============================================
 
 @app.route('/api/admin/reset-submissions', methods=['POST'])
+@admin_required
 def api_admin_reset_submissions():
-    if 'username' not in session or session.get('role') != 'admin':
-        return jsonify({'success': False, 'message': 'Unauthorized'}), 401
     try:
         from create_auth_db import reset_all_submissions
         reset_all_submissions()
@@ -304,19 +328,15 @@ def api_admin_reset_submissions():
         return jsonify({'success': False, 'message': str(e)}), 500
 
 @app.route('/api/admin/students')
+@admin_required
 def api_admin_students():
-    if 'username' not in session or session.get('role') != 'admin':
-        return jsonify([]), 401
-    
     students = get_all_students()
     return jsonify(students)
 
 
 @app.route('/api/admin/submissions')
+@admin_required
 def api_admin_submissions():
-    if 'username' not in session or session.get('role') != 'admin':
-        return jsonify([]), 401
-    
     username = request.args.get('username')
     
     if username:
@@ -328,10 +348,8 @@ def api_admin_submissions():
 
 
 @app.route('/api/admin/submission/<int:submission_id>')
+@admin_required
 def api_admin_submission_detail(submission_id):
-    if 'username' not in session or session.get('role') != 'admin':
-        return jsonify({}), 401
-    
     submission = get_submission_detail(submission_id)
     if submission:
         return jsonify(submission)
@@ -339,11 +357,9 @@ def api_admin_submission_detail(submission_id):
 
 
 @app.route('/api/admin/submission/<int:submission_id>/similar')
+@admin_required
 def api_admin_similar_submissions(submission_id):
     """Find submissions with similar code to the given submission"""
-    if 'username' not in session or session.get('role') != 'admin':
-        return jsonify([]), 401
-    
     submission = get_submission_detail(submission_id)
     if not submission or not submission.get('file_content'):
         return jsonify([]), 404
@@ -363,11 +379,9 @@ def api_admin_similar_submissions(submission_id):
 
 
 @app.route('/api/admin/send-reports/preview', methods=['POST'])
+@admin_required
 def api_admin_send_reports_preview():
     """Preview which students will receive reports based on time range"""
-    if 'username' not in session or session.get('role') != 'admin':
-        return jsonify({'error': 'Unauthorized'}), 401
-    
     data = request.get_json()
     time_range = data.get('timeRange', 'all')  # 1h, 6h, 24h, 7d, 30d, all
     
@@ -413,11 +427,9 @@ def api_admin_send_reports_preview():
 
 
 @app.route('/api/admin/export-submissions')
+@admin_required
 def export_submissions_csv():
     """Export all submissions as CSV"""
-    if 'username' not in session or session.get('role') != 'admin':
-        return jsonify({'error': 'Unauthorized'}), 401
-    
     submissions = get_all_submissions()
     
     # Create CSV
@@ -445,18 +457,16 @@ def export_submissions_csv():
 
 
 @app.route('/analytics')
+@admin_required
 def analytics_dashboard():
     """Analytics Dashboard Page"""
-    if 'username' not in session or session.get('role') != 'admin':
-        return redirect('/login.html')
     return render_template('analytics.html')
 
 
 @app.route('/analytics.html')
+@admin_required
 def analytics_html():
     """Analytics Dashboard HTML Page"""
-    if 'username' not in session or session.get('role') != 'admin':
-        return redirect('/login.html')
     return render_template('analytics.html')
 
 
@@ -468,11 +478,9 @@ def get_allowed_extensions():
 
 
 @app.route('/api/admin/config/extensions', methods=['POST'])
+@admin_required
 def update_allowed_extensions():
     """Update allowed extensions (admin only)"""
-    if 'username' not in session or session.get('role') != 'admin':
-        return jsonify({'error': 'Unauthorized'}), 401
-    
     data = request.get_json()
     exts = data.get('extensions', '')
     
@@ -485,11 +493,9 @@ def update_allowed_extensions():
 
 
 @app.route('/api/admin/send-reports', methods=['POST'])
+@admin_required
 def api_admin_send_reports():
     """Send reports to students based on time range"""
-    if 'username' not in session or session.get('role') != 'admin':
-        return jsonify({'error': 'Unauthorized'}), 401
-    
     from email_utils import send_bulk_reports, is_email_configured
     
     if not is_email_configured():
@@ -562,21 +568,17 @@ def get_questions_active():
 
 
 @app.route('/api/admin/questions')
+@admin_required
 def get_questions_admin():
     """Get all questions for admin (including inactive)"""
-    if 'username' not in session or session.get('role') != 'admin':
-        return jsonify({'error': 'Unauthorized'}), 401
-    
     questions = get_all_questions()
     return jsonify(questions)
 
 
 @app.route('/api/admin/upload-question', methods=['POST'])
+@admin_required
 def upload_question_file():
     """Upload a question file and extract content"""
-    if 'username' not in session or session.get('role') != 'admin':
-        return jsonify({'success': False, 'message': 'Unauthorized'}), 401
-    
     if 'questionFile' not in request.files:
         return jsonify({'success': False, 'message': 'No file uploaded'}), 400
     
@@ -639,11 +641,9 @@ def upload_question_file():
 
 
 @app.route('/api/admin/questions', methods=['GET'])
+@admin_required
 def get_all_questions_route():
     """Get all questions for admin"""
-    if 'username' not in session or session.get('role') != 'admin':
-        return jsonify({'error': 'Unauthorized'}), 401
-    
     try:
         questions = get_all_questions()
         return jsonify(questions)
@@ -652,11 +652,9 @@ def get_all_questions_route():
 
 
 @app.route('/api/admin/delete-question/<int:question_id>', methods=['DELETE'])
+@admin_required
 def delete_question_route(question_id):
     """Delete a question (soft delete)"""
-    if 'username' not in session or session.get('role') != 'admin':
-        return jsonify({'error': 'Unauthorized'}), 401
-    
     try:
         delete_question(question_id)
         return jsonify({'success': True, 'message': 'Question deleted successfully'})
@@ -665,11 +663,9 @@ def delete_question_route(question_id):
 
 
 @app.route('/api/admin/permanently-delete-question/<int:question_id>', methods=['DELETE'])
+@admin_required
 def permanently_delete_question_route(question_id):
     """Permanently delete a question from database"""
-    if 'username' not in session or session.get('role') != 'admin':
-        return jsonify({'error': 'Unauthorized'}), 401
-    
     try:
         permanently_delete_question(question_id)
         return jsonify({'success': True, 'message': 'Question permanently deleted'})
