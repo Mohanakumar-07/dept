@@ -24,8 +24,13 @@ import os
 import re
 from werkzeug.utils import secure_filename
 
+# Get the base directory paths
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+FRONTEND_DIR = os.path.join(BASE_DIR, 'frontend')
 
-app = Flask(__name__)
+app = Flask(__name__, 
+            template_folder=os.path.join(FRONTEND_DIR, 'templates'),
+            static_folder=os.path.join(FRONTEND_DIR, 'static'))
 app.secret_key = os.environ.get('SECRET_KEY', 'dev_secret_key')
 
 # =====================================================
@@ -679,13 +684,12 @@ def permanently_delete_question_route(question_id):
 
 @app.route('/static/<path:filename>')
 def serve_static(filename):
-    return send_from_directory('static', filename)
+    return send_from_directory(os.path.join(FRONTEND_DIR, 'static'), filename)
 
 
 @app.route('/<path:filename>')
 def serve_static_file(filename):
-    static_folder = os.path.join(os.getcwd(), 'static')
-    return send_from_directory(static_folder, filename)
+    return send_from_directory(os.path.join(FRONTEND_DIR, 'static'), filename)
 
 
 # ============================================
