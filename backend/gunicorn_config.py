@@ -39,4 +39,3 @@ tmp_upload_dir = None
 # SSL (if needed)
 # keyfile = None
 # certfile = None
-
